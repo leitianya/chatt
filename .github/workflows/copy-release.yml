@@ -862,7 +862,7 @@ jobs:
                 printf '%s\t%s\t%s\n' "${registry,,}" "${username}" "${password}" >> "${AUTH_MAP}"
                 echo "::add-mask::${password}"
               fi
-            done < <(printf '%s' "${IMAGE_MAPPINGS}" | tr ';；' '\n\n' | sed '/^$/d')
+            done < <(printf '%s\n' "${IMAGE_MAPPINGS}" | sed 's/；/;/g; s/;/\n/g' | sed '/^[[:space:]]*$/d')
           fi
           sort -u "${MAP}" -o "${MAP}"
           echo "Docker 映射："
