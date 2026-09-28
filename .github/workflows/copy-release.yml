@@ -82,19 +82,7 @@ on:
           - selected
 
       image_mappings:
-        description: "Docker 映射，多个用分号分隔；留空自动使用上游 GHCR"
-        required: false
-        type: string
-        default: ""
-
-      dockerhub_username:
-        description: "Docker Hub 用户名；公开镜像也建议填写，留空时使用 SOURCE_REGISTRY_USERNAME Secret"
-        required: false
-        type: string
-        default: ""
-
-      dockerhub_password:
-        description: "Docker Hub Access Token 或密码；留空时使用 SOURCE_REGISTRY_TOKEN Secret"
+        description: "Docker 映射：源=目标|用户名|Token；多个用分号分隔；账号可省略"
         required: false
         type: string
         default: ""
@@ -819,8 +807,8 @@ jobs:
       STRIP_V_PREFIX: ${{ inputs.strip_v_prefix }}
       UPDATE_LATEST: ${{ inputs.update_latest }}
       GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SOURCE_USERNAME: ${{ inputs.dockerhub_username || secrets.SOURCE_REGISTRY_USERNAME }}
-      SOURCE_TOKEN: ${{ inputs.dockerhub_password || secrets.SOURCE_REGISTRY_TOKEN }}
+      SOURCE_USERNAME: ${{ secrets.SOURCE_REGISTRY_USERNAME }}
+      SOURCE_TOKEN: ${{ secrets.SOURCE_REGISTRY_TOKEN }}
     steps:
       - name: 安装 crane
         run: |
@@ -832,40 +820,85 @@ jobs:
         id: mappings
         run: |
           set -euo pipefail
-          MAP="${RUNNER_TEMP}/maps.tsv";:>"${MAP}"
+          MAP="${RUNNER_TEMP}/maps.tsv"
+          AUTH_MAP="${RUNNER_TEMP}/registry-auth.tsv"
+          :>"${MAP}"
+          :>"${AUTH_MAP}"
           if [ -z "${IMAGE_MAPPINGS}" ]; then
             printf '%s\t%s\n' "ghcr.io/${SOURCE_REPO,,}" "${TARGET_REPO#*/}" > "${MAP}"
           else
-            printf '%s' "${IMAGE_MAPPINGS}"|tr ';；' '\n\n'|sed '/^$/d'|while read -r item;do
-              item="$(echo "${item}"|xargs)"
-              if [[ "${item}" == *"="* ]];then src="${item%%=*}";name="${item#*=}";else src="${item}";name="${src##*/}";fi
-              [ -n "${src}" ]&&[ -n "${name}" ]||exit 1
+            while IFS= read -r item;do
+              item="$(printf '%s' "${item}" | xargs)"
+              [ -n "${item}" ] || continue
+
+              mapping="${item%%|*}"
+              credentials=""
+              if [[ "${item}" == *"|"* ]]; then credentials="${item#*|}"; fi
+
+              if [[ "${mapping}" == *"="* ]];then
+                src="${mapping%%=*}"
+                name="${mapping#*=}"
+              else
+                src="${mapping}"
+                name="${src##*/}"
+              fi
+              src="$(printf '%s' "${src}" | xargs)"
+              name="$(printf '%s' "${name}" | xargs)"
+              [ -n "${src}" ]&&[ -n "${name}" ]||{ echo "::error::Docker 映射格式错误：${mapping}";exit 1;}
               [[ "${src}" != *"@"* ]]||{ echo "::error::源镜像不能包含 Digest";exit 1;}
+              [[ "${src}" != *":"* || "${src%%/*}" == *":"* ]]||{ echo "::error::源镜像地址不要填写 Tag，请通过版本选项选择：${src}";exit 1;}
               printf '%s\t%s\n' "${src,,}" "${name,,}" >> "${MAP}"
-            done
+
+              if [ -n "${credentials}" ]; then
+                if [[ "${credentials}" != *"|"* ]]; then
+                  echo "::error::账号格式错误，应为：源=目标|用户名|AccessToken"
+                  exit 1
+                fi
+                username="${credentials%%|*}"
+                password="${credentials#*|}"
+                [ -n "${username}" ] || { echo "::error::Docker 用户名不能为空";exit 1;}
+                [ -n "${password}" ] || { echo "::error::Docker 密码或 Access Token 不能为空";exit 1;}
+                registry="${src%%/*}"
+                printf '%s\t%s\t%s\n' "${registry,,}" "${username}" "${password}" >> "${AUTH_MAP}"
+                echo "::add-mask::${password}"
+              fi
+            done < <(printf '%s' "${IMAGE_MAPPINGS}" | tr ';；' '\n\n' | sed '/^$/d')
           fi
           sort -u "${MAP}" -o "${MAP}"
-          cat "${MAP}"
+          echo "Docker 映射："
+          awk -F '\t' '{print $1 " -> " $2}' "${MAP}"
           echo "map_file=${MAP}" >> "${GITHUB_OUTPUT}"
+          echo "auth_file=${AUTH_MAP}" >> "${GITHUB_OUTPUT}"
       - name: 登录源镜像仓库
         env:
           MAP: ${{ steps.mappings.outputs.map_file }}
+          AUTH_MAP: ${{ steps.mappings.outputs.auth_file }}
         run: |
           set -euo pipefail
-          if [ -z "${SOURCE_USERNAME}" ] && [ -z "${SOURCE_TOKEN}" ]; then
-            echo "未填写源镜像仓库账号，使用匿名访问。Docker Hub 全量搬运可能受到拉取频率限制。"
-            exit 0
-          fi
-          [ -n "${SOURCE_USERNAME}" ] || { echo "::error::已填写 Docker 密码或 Token，但用户名为空"; exit 1; }
-          [ -n "${SOURCE_TOKEN}" ] || { echo "::error::已填写 Docker 用户名，但密码或 Token 为空"; exit 1; }
-          echo "::add-mask::${SOURCE_TOKEN}"
-          while IFS= read -r registry; do
-            [ -n "${registry}" ] || continue
+          login_one() {
+            local registry="$1" username="$2" password="$3" login_registry
             login_registry="${registry}"
             [ "${registry}" = "docker.io" ] && login_registry="index.docker.io"
+            echo "::add-mask::${password}"
             echo "登录源镜像仓库：${registry}"
-            printf '%s' "${SOURCE_TOKEN}" | crane auth login "${login_registry}" --username "${SOURCE_USERNAME}" --password-stdin
-          done < <(cut -f1 "${MAP}" | awk -F/ '{print $1}' | sort -u)
+            printf '%s' "${password}" | crane auth login "${login_registry}" --username "${username}" --password-stdin
+          }
+
+          if [ -s "${AUTH_MAP}" ]; then
+            while IFS=$'\t' read -r registry username password;do
+              [ -n "${registry}" ] || continue
+              login_one "${registry}" "${username}" "${password}"
+            done < "${AUTH_MAP}"
+          elif [ -n "${SOURCE_USERNAME}" ] || [ -n "${SOURCE_TOKEN}" ]; then
+            [ -n "${SOURCE_USERNAME}" ] || { echo "::error::SOURCE_REGISTRY_USERNAME 为空";exit 1;}
+            [ -n "${SOURCE_TOKEN}" ] || { echo "::error::SOURCE_REGISTRY_TOKEN 为空";exit 1;}
+            while IFS= read -r registry;do
+              [ -n "${registry}" ] || continue
+              login_one "${registry}" "${SOURCE_USERNAME}" "${SOURCE_TOKEN}"
+            done < <(cut -f1 "${MAP}" | awk -F/ '{print $1}' | sort -u)
+          else
+            echo "未提供源镜像仓库账号，使用匿名访问。"
+          fi
       - name: 登录目标 GHCR
         run: |
           printf '%s' "${GHCR_TOKEN}"|crane auth login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
