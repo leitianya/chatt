@@ -87,6 +87,18 @@ on:
         type: string
         default: ""
 
+      dockerhub_username:
+        description: "Docker Hub 用户名；公开镜像也建议填写，留空时使用 SOURCE_REGISTRY_USERNAME Secret"
+        required: false
+        type: string
+        default: ""
+
+      dockerhub_password:
+        description: "Docker Hub Access Token 或密码；留空时使用 SOURCE_REGISTRY_TOKEN Secret"
+        required: false
+        type: string
+        default: ""
+
       copy_mode:
         description: "Release、Docker 和 selected Tag 的版本选择方式"
         required: true
@@ -807,8 +819,8 @@ jobs:
       STRIP_V_PREFIX: ${{ inputs.strip_v_prefix }}
       UPDATE_LATEST: ${{ inputs.update_latest }}
       GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SOURCE_USERNAME: ${{ secrets.SOURCE_REGISTRY_USERNAME }}
-      SOURCE_TOKEN: ${{ secrets.SOURCE_REGISTRY_TOKEN }}
+      SOURCE_USERNAME: ${{ inputs.dockerhub_username || secrets.SOURCE_REGISTRY_USERNAME }}
+      SOURCE_TOKEN: ${{ inputs.dockerhub_password || secrets.SOURCE_REGISTRY_TOKEN }}
     steps:
       - name: 安装 crane
         run: |
@@ -836,12 +848,24 @@ jobs:
           cat "${MAP}"
           echo "map_file=${MAP}" >> "${GITHUB_OUTPUT}"
       - name: 登录源镜像仓库
-        if: ${{ env.SOURCE_USERNAME != '' && env.SOURCE_TOKEN != '' }}
         env:
           MAP: ${{ steps.mappings.outputs.map_file }}
         run: |
           set -euo pipefail
-          cut -f1 "${MAP}"|awk -F/ '{print $1}'|sort -u|while read -r registry;do printf '%s' "${SOURCE_TOKEN}"|crane auth login "${registry}" --username "${SOURCE_USERNAME}" --password-stdin;done
+          if [ -z "${SOURCE_USERNAME}" ] && [ -z "${SOURCE_TOKEN}" ]; then
+            echo "未填写源镜像仓库账号，使用匿名访问。Docker Hub 全量搬运可能受到拉取频率限制。"
+            exit 0
+          fi
+          [ -n "${SOURCE_USERNAME}" ] || { echo "::error::已填写 Docker 密码或 Token，但用户名为空"; exit 1; }
+          [ -n "${SOURCE_TOKEN}" ] || { echo "::error::已填写 Docker 用户名，但密码或 Token 为空"; exit 1; }
+          echo "::add-mask::${SOURCE_TOKEN}"
+          while IFS= read -r registry; do
+            [ -n "${registry}" ] || continue
+            login_registry="${registry}"
+            [ "${registry}" = "docker.io" ] && login_registry="index.docker.io"
+            echo "登录源镜像仓库：${registry}"
+            printf '%s' "${SOURCE_TOKEN}" | crane auth login "${login_registry}" --username "${SOURCE_USERNAME}" --password-stdin
+          done < <(cut -f1 "${MAP}" | awk -F/ '{print $1}' | sort -u)
       - name: 登录目标 GHCR
         run: |
           printf '%s' "${GHCR_TOKEN}"|crane auth login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
@@ -852,42 +876,31 @@ jobs:
           set -euo pipefail
           VERSIONS="${RUNNER_TEMP}/versions.json";SUMMARY="${RUNNER_TEMP}/summary.txt"
           printf '%s' "${SELECTED_JSON}" > "${VERSIONS}";:>"${SUMMARY}"
+          MAP_COUNT="$(awk 'NF {count++} END {print count+0}' "${MAP}")"
+          VERSION_COUNT="$(jq 'length' "${VERSIONS}")"
+          [ "${MAP_COUNT}" -gt 0 ] || { echo "::error::没有生成任何 Docker 镜像映射，请检查 Docker 映射输入"; exit 1; }
+          [ "${VERSION_COUNT}" -gt 0 ] || { echo "::error::没有选中任何 Docker 版本，请检查 copy_mode 和版本输入"; exit 1; }
+          echo "准备搬运：镜像映射 ${MAP_COUNT} 个，版本 ${VERSION_COUNT} 个。"
           OK=0;SKIP=0;MISSING=0;FAIL=0
           while IFS=$'\t' read -r source_image target_name;do
             target_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${target_name}";last=""
-            while read -r release_tag;do
+            while IFS= read -r release_tag;do
+              [ -n "${release_tag}" ] || continue
               target_ref="${target_image}:${release_tag}"
-
-              # 自动匹配源 Docker Tag：优先完全一致，再尝试添加或移除小写 v。
-              # 保留 strip_v_prefix：启用时优先尝试去掉 v 的版本，兼容原有使用习惯。
               CANDIDATES=()
               if [ "${STRIP_V_PREFIX}" = true ] && [[ "${release_tag}" == v* ]]; then
                 CANDIDATES+=("${release_tag#v}" "${release_tag}")
               else
                 CANDIDATES+=("${release_tag}")
-                if [[ "${release_tag}" == v* ]]; then
-                  CANDIDATES+=("${release_tag#v}")
-                else
-                  CANDIDATES+=("v${release_tag}")
-                fi
+                if [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}"); else CANDIDATES+=("v${release_tag}"); fi
               fi
-
-              source_ref=""
-              checked_refs=""
+              source_ref="";checked_refs=""
               for candidate_tag in "${CANDIDATES[@]}";do
                 candidate_ref="${source_image}:${candidate_tag}"
                 if [ -n "${checked_refs}" ];then checked_refs="${checked_refs}, ${candidate_ref}";else checked_refs="${candidate_ref}";fi
-                if crane manifest "${candidate_ref}" >/dev/null 2>&1;then
-                  source_ref="${candidate_ref}"
-                  break
-                fi
+                if crane manifest "${candidate_ref}" >/dev/null 2>&1;then source_ref="${candidate_ref}";break;fi
               done
-
-              if [ -z "${source_ref}" ];then
-                echo "缺失（已自动匹配）：${checked_refs}" >> "${SUMMARY}"
-                MISSING=$((MISSING+1))
-                continue
-              fi
+              if [ -z "${source_ref}" ];then echo "缺失（已自动匹配）：${checked_refs}" >> "${SUMMARY}";MISSING=$((MISSING+1));continue;fi
               echo "匹配 ${release_tag} -> ${source_ref}" >> "${SUMMARY}"
               if [ "${SKIP_EXISTING}" = true ]&&crane manifest "${target_ref}">/dev/null 2>&1;then echo "跳过 ${target_ref}" >> "${SUMMARY}";SKIP=$((SKIP+1));continue;fi
               if crane copy "${source_ref}" "${target_ref}";then echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}";last="${source_ref}";OK=$((OK+1));else echo "失败 ${source_ref}" >> "${SUMMARY}";FAIL=$((FAIL+1));fi
@@ -896,4 +909,6 @@ jobs:
           done < "${MAP}"
           echo "Docker 成功：${OK}；跳过：${SKIP}；缺失：${MISSING}；失败：${FAIL}"
           cat "${SUMMARY}"
+          TOTAL=$((OK+SKIP+MISSING+FAIL))
+          [ "${TOTAL}" -gt 0 ] || { echo "::error::没有处理任何 Docker 镜像，请检查映射文件和版本列表"; exit 1; }
           [ "${FAIL}" -eq 0 ]
